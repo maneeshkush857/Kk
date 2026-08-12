@@ -19,57 +19,103 @@
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  CELL 1 — CENTRAL CONFIGURATION                                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
+# Google Colab user parameters (use @param decorators for interactive widgets)
+
+duration_seconds = 31.5  # @param {"type":"number","min":1,"max":60,"step":0.1}
+fps = 24  # @param {"type":"integer","min":1,"max":60}
+width = 1280  # @param {"type":"integer","min":256,"max":1920,"step":32}
+height = 720  # @param {"type":"integer","min":256,"max":1920,"step":32}
+seed = 123456  # @param {"type":"integer"}
+quality_mode = "t4_safe"  # @param ["t4_safe","t4_balanced","t4_aggressive"]
+chunk_frames = 97  # @param {"type":"integer","min":17,"max":193,"step":8}
+vae_decode_chunk_frames = 49  # @param {"type":"integer","min":9,"max":97,"step":8}
+min_chunk_frames = 17  # @param {"type":"integer","min":9,"max":49,"step":8}
+max_oom_retries = 3  # @param {"type":"integer","min":0,"max":10}
+gpu_safety_margin_gb = 1.5  # @param {"type":"number","min":0.5,"max":4.0,"step":0.1}
+dry_run = False  # @param {"type":"boolean"}
+validate_pipeline_first = True  # @param {"type":"boolean"}
+validation_duration_seconds = 3.0  # @param {"type":"number","min":1,"max":10,"step":0.5}
+resume = True  # @param {"type":"boolean"}
+allow_auto_downgrade = False  # @param {"type":"boolean"}
+keep_temp_chunks = False  # @param {"type":"boolean"}
+cleanup_after_chunk = True  # @param {"type":"boolean"}
+cleanup_after_stage = True  # @param {"type":"boolean"}
+enable_memory_logging = True  # @param {"type":"boolean"}
+verify_model_files = True  # @param {"type":"boolean"}
+lora_dynamic_enabled = True  # @param {"type":"boolean"}
+lora_omninfт_enabled = True  # @param {"type":"boolean"}
+lora_transition_enabled = True  # @param {"type":"boolean"}
+lora_mvcamera_enabled = True  # @param {"type":"boolean"}
+
+# Global prompt (editable text field)
+global_prompt = """Create a highly realistic cinematic AI music video using the provided reference image. Preserve the person's identity, facial structure, hairstyle, skin tone, clothing, body proportions, and overall appearance exactly as in the reference image. The singer must remain fully recognizable throughout the entire video with absolutely no identity drift.
+
+The person is performing directly to the camera as a world-class pop, hip-hop and rap singer during a sold-out stadium concert. Generate perfectly synchronized lip movements from the provided lyrics or audio.
+
+drclipz, Aggressive cinematic music video camera. Fast push-in, fast pull-back, energetic handheld movement, rhythmic tracking shots, dynamic low-angle hero shots, occasional close-ups on emotional lyrics, subtle orbit around the singer, cinematic motion blur. Camera movement follows the beat and amplifies the performance.
+
+Premium concert lighting with cinematic key light, colorful neon rim lights, volumetric atmosphere, dramatic contrast, realistic skin tones, vibrant electronic music video mood.
+
+Photorealistic, blockbuster-quality AI music video, premium live concert performance, ultra-high facial fidelity, charismatic superstar, emotionally captivating, explosive stage energy, bold movement, powerful attitude, modern pop, hip-hop and rap performance, every second feels alive, impossible to look away.
+
+Spoken dialogue:
+"Open up the canvas, blank space on my screen.
+Drag a Checkpoint Loader, you know what I mean.
+KSampler in the middle, VAE on the right,
+Put the Text Encoder, yeah, building tonight.
+Connect the nodes, run the queue,
+Watch the latent flow right through.
+Green, nothing green, nothing yellow,
+Positive Prompt, in my hub."
+"""  # @param {"type":"string"}
 
 CONFIG = {
     # ── Timeline (from JSON node 131 / VHS_VideoCombine) ─────────────────────
-    "duration_seconds":           31.5,   # JSON: end_second=31.5
-    "fps":                        24,     # JSON: frame_rate=24
-    "total_frames":               756,    # JSON: duration_frames=756
+    "duration_seconds":           duration_seconds,
+    "fps":                        fps,
+    "total_frames":               round(duration_seconds * fps),
 
     # ── Resolution (from JSON LTXDirector node 131) ───────────────────────────
-    "width":                      1280,
-    "height":                     720,
+    "width":                      width,
+    "height":                     height,
 
     # ── Seed ─────────────────────────────────────────────────────────────────
-    "seed":                       123456,
+    "seed":                       seed,
 
     # ── Quality / memory profile ──────────────────────────────────────────────
-    # t4_safe     : conservative chunks, aggressive cleanup, model offload
-    # t4_balanced : moderate, larger chunks
-    # t4_aggressive : large chunks only when telemetry confirms VRAM
-    "quality_mode":               "t4_safe",
+    "quality_mode":               quality_mode,
 
     # ── Chunking ──────────────────────────────────────────────────────────────
     "auto_chunk_size":            True,
-    "chunk_frames":               97,     # LTX valid = 8k+1 → 97 (≈4s@24fps)
-    "vae_decode_chunk_frames":    49,     # smaller chunk for decode pass
-    "min_chunk_frames":           17,     # absolute minimum (8*2+1)
+    "chunk_frames":               chunk_frames,
+    "vae_decode_chunk_frames":    vae_decode_chunk_frames,
+    "min_chunk_frames":           min_chunk_frames,
 
     # ── OOM recovery ──────────────────────────────────────────────────────────
     "auto_reduce_chunk_on_oom":   True,
     "oom_reduction_factor":       0.75,
-    "max_oom_retries":            3,
+    "max_oom_retries":            max_oom_retries,
 
     # ── VRAM safety ───────────────────────────────────────────────────────────
-    "gpu_safety_margin_gb":       1.5,
+    "gpu_safety_margin_gb":       gpu_safety_margin_gb,
 
     # ── Pipeline control ──────────────────────────────────────────────────────
-    "dry_run":                    False,
-    "validate_pipeline_first":    True,
-    "validation_duration_seconds":3,
+    "dry_run":                    dry_run,
+    "validate_pipeline_first":    validate_pipeline_first,
+    "validation_duration_seconds":validation_duration_seconds,
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    "resume":                     True,
+    "resume":                     resume,
 
     # ── Resolution guard ──────────────────────────────────────────────────────
-    "allow_auto_downgrade":       False,
+    "allow_auto_downgrade":       allow_auto_downgrade,
 
     # ── Output ────────────────────────────────────────────────────────────────
-    "keep_temp_chunks":           False,
-    "cleanup_after_chunk":        True,
-    "cleanup_after_stage":        True,
-    "enable_memory_logging":      True,
-    "verify_model_files":         True,
+    "keep_temp_chunks":           keep_temp_chunks,
+    "cleanup_after_chunk":        cleanup_after_chunk,
+    "cleanup_after_stage":        cleanup_after_stage,
+    "enable_memory_logging":      enable_memory_logging,
+    "verify_model_files":         verify_model_files,
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     "workspace":                  "/content/ltx23_workspace",
@@ -78,13 +124,12 @@ CONFIG = {
     "final_video_name":           "LTX23_Director_30s.mp4",
 
     # ── LoRA active switches (JSON node 138 has all 4 ON) ────────────────────
-    "lora_dynamic_enabled":       True,
-    "lora_omninfт_enabled":       True,
-    "lora_transition_enabled":    True,
-    "lora_mvcamera_enabled":      True,
+    "lora_dynamic_enabled":       lora_dynamic_enabled,
+    "lora_omninfт_enabled":       lora_omninfт_enabled,
+    "lora_transition_enabled":    lora_transition_enabled,
+    "lora_mvcamera_enabled":      lora_mvcamera_enabled,
 
     # ── Image inputs (upload slots — filled in CELL 12) ──────────────────────
-    # JSON LTXDirector has 5 image segments. Set paths before running CELL 19.
     "input_images": [
         None,   # Segment 1 — frames 0..226    (set to file path)
         None,   # Segment 2 — frames 226..387
@@ -95,9 +140,8 @@ CONFIG = {
     "input_audio": None,   # Path to audio file (e.g. "Late night trap.mp3")
 
     # ── Global prompt (from JSON LTXDirector node 131 property) ─────────────
-    "global_prompt": (
-        "Create a highly realistic cinematic AI music video using the provided reference image. "
-        "Preserve the person's identity, facial structure, hairstyle, skin tone, clothing, "
+    "global_prompt": global_prompt,
+}
         "body proportions, and overall appearance exactly as in the reference image. "
         "The singer must remain fully recognizable throughout the entire video with absolutely "
         "no identity drift.\n\n"
@@ -371,10 +415,10 @@ print("=" * 60)
 print("CELL 4 — DEPENDENCY INSTALLATION")
 print("=" * 60)
 
-# apt packages (idempotent)
-_apt_packages = ["aria2", "ffmpeg", "ffprobe"]
+# apt packages (idempotent) - using ffmpeg instead of ffprobe which is part of ffmpeg
+_apt_packages = ["aria2", "ffmpeg"]
 _apt_cmd = f"apt-get -y install -qq {' '.join(_apt_packages)}"
-_run(_apt_cmd, "apt: aria2 + ffmpeg + ffprobe")
+_run(_apt_cmd, "apt: aria2 + ffmpeg")
 
 # pip packages (idempotent — pip skips already-installed)
 _pip_packages = [
@@ -382,7 +426,7 @@ _pip_packages = [
     "torchsde einops diffusers accelerate",
     "av spandrel albumentations onnx opencv-python onnxruntime",
     "tqdm ipywidgets nest_asyncio psutil",
-    "imageio imageio-ffmpeg",
+    "imageio imageio-ffmpeg requests",
 ]
 for _pkg in _pip_packages:
     _run(f"pip install -q {_pkg}", f"pip: {_pkg}")
@@ -720,14 +764,16 @@ def _is_valid_model_file(path: str, min_size_mb: float = 1.0) -> bool:
 def download_model(url: str, directory: str, filename: str,
                    min_size_mb: float = 1.0, retries: int = 3) -> bool:
     """
-    Download a model with aria2c.
+    Download a model using Python requests (reliable in Colab).
     - Creates destination directory.
     - Skips if a valid complete file already exists.
-    - Resumes incomplete downloads (aria2c -c flag).
+    - Resumes incomplete downloads using Range header.
     - Retries on failure.
     - Does NOT load the model into GPU.
     - Returns True on success, False on failure.
     """
+    import requests
+    
     dest_path = os.path.join(directory, filename)
     os.makedirs(directory, exist_ok=True)
 
@@ -737,23 +783,24 @@ def download_model(url: str, directory: str, filename: str,
         print(f"  ✓ Exists ({sz:.0f} MB): {filename}")
         return True
 
-    # aria2c with resume + 16 parallel connections
-    _aria_cmd = (
-        f"aria2c --console-log-level=error "
-        f"-c -x 16 -s 16 -k 1M "
-        f"--summary-interval=30 "
-        f"--max-tries={retries} "
-        f"-d \"{directory}\" -o \"{filename}\" "
-        f"\"{url}\""
-    )
+    # Python requests download with resume support
+    headers = {}
+    existing_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    if existing_size > 0:
+        headers['Range'] = f'bytes={existing_size}-'
 
     print(f"  ↓ Downloading: {filename}")
     for attempt in range(1, retries + 1):
         try:
-            result = subprocess.run(
-                _aria_cmd, shell=True, check=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                
+                mode = 'ab' if existing_size > 0 else 'wb'
+                with open(dest_path, mode) as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            
             if _is_valid_model_file(dest_path, min_size_mb):
                 sz = _file_size_mb(dest_path)
                 print(f"    ✓ Complete ({sz:.0f} MB): {filename}")
@@ -761,9 +808,8 @@ def download_model(url: str, directory: str, filename: str,
             else:
                 sz = _file_size_mb(dest_path)
                 print(f"    ✗ File too small ({sz:.1f} MB < {min_size_mb} MB) — attempt {attempt}/{retries}")
-        except subprocess.CalledProcessError as e:
-            err = e.stderr.strip()[:200] if e.stderr else "unknown"
-            print(f"    ✗ aria2c error (attempt {attempt}/{retries}): {err}")
+        except Exception as e:
+            print(f"    ✗ Download error (attempt {attempt}/{retries}): {str(e)[:100]}")
 
     print(f"  ✗ FAILED after {retries} attempts: {filename}")
     return False
