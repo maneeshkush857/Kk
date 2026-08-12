@@ -2207,6 +2207,216 @@ Suggested action: Reduce CONFIG['vae_decode_chunk_frames'] or use 't4_safe' mode
 """)
 
 
+def run_validation_workflow(
+    total_frames: int,
+    seed:         int,
+    global_prompt:str,
+    fps:          int,
+) -> dict:
+    """
+    Minimal pipeline for the 3-second validation pass.
+    Does NOT use LTXDirector — uses the same lean pattern as ltx2_ti2v.py:
+      UNet → CLIP → CLIPTextEncode → del CLIP → ConditioningZeroOut
+      → LTXVConditioning → EmptyLTXVLatentVideo → LTXVEmptyLatentAudio
+      → LTXVConcatAVLatent → SamplerCustomAdvanced → LTXVSeparateAVLatent
+    Peak CPU RAM: ~3 GB total. Never crashes Colab T4.
+    Returns the same dict shape as run_director_workflow().
+    """
+    # Compact validation resolution: same aspect ratio, much smaller
+    VAL_W, VAL_H = 576, 320   # 576×320 @ 1.8:1 AR — fits comfortably in T4 RAM
+    VAL_FRAMES   = total_frames   # already set to ~73 by validation_frame_count()
+
+    MEM.print_memory("VALIDATION — BEFORE")
+
+    with torch.inference_mode():
+
+        # ── Load UNet ──────────────────────────────────────────────────────────
+        print("  [VAL/N135] Loading UNet GGUF…")
+        _unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
+        _unet_out    = _unet_loader.load_unet(unet_name=MODEL_FILENAMES["ltx23_unet"])
+        _model       = get_value_at_index(_unet_out, 0)
+        del _unet_out
+        MEM.print_memory("VALIDATION — after UNet")
+
+        # ── Load CLIP → encode → delete immediately ────────────────────────────
+        print("  [VAL/N12] Loading CLIP…")
+        _clip_loader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
+        _clip_out    = _clip_loader.load_clip(
+            clip_name1 = MODEL_FILENAMES["gemma_fp4"],
+            clip_name2 = MODEL_FILENAMES["ltx23_text_proj"],
+            type       = "ltxv",
+            device     = "default",
+        )
+        MEM.print_memory("VALIDATION — after CLIP")
+
+        # ── CLIPTextEncode ────────────────────────────────────────────────────
+        _clip_encode  = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
+        _positive_enc = _clip_encode.encode(
+            text = global_prompt[:300],   # short prompt for validation
+            clip = get_value_at_index(_clip_out, 0),
+        )
+        # Delete CLIP immediately after encoding
+        del _clip_out
+        MEM.aggressive_cleanup()
+        MEM.print_memory("VALIDATION — after CLIP freed")
+
+        # ── ConditioningZeroOut + LTXVConditioning ────────────────────────────
+        _czo      = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+        _neg_zero = _czo.zero_out(conditioning=get_value_at_index(_positive_enc, 0))
+
+        _ltxvcond = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
+        _cond_out = _ltxvcond.EXECUTE_NORMALIZED(
+            frame_rate = fps,
+            positive   = get_value_at_index(_positive_enc, 0),
+            negative   = get_value_at_index(_neg_zero, 0),
+        )
+        del _positive_enc, _neg_zero
+        MEM.soft_cleanup()
+
+        # ── EmptyLTXVLatentVideo ───────────────────────────────────────────────
+        _latent_w  = max(32, (VAL_W // 32) * 32)
+        _latent_h  = max(32, (VAL_H // 32) * 32)
+        _empty_lat = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
+        _vid_latent_empty = _empty_lat.EXECUTE_NORMALIZED(
+            width      = _latent_w  // 2,   # latent space = pixel / 8 via VAE, but
+            height     = _latent_h  // 2,   # EmptyLTXVLatentVideo takes pixel-space dims
+            length     = VAL_FRAMES,
+            batch_size = 1,
+        )
+
+        # ── EmptyLTXVLatentAudio ───────────────────────────────────────────────
+        print("  [VAL/N8+audio] Loading Audio VAE for empty latent…")
+        _audio_vae_obj = load_audio_vae_compat(MODEL_FILENAMES["audio_vae"])
+        _empty_aud_node= NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
+        _aud_latent_empty = _empty_aud_node.EXECUTE_NORMALIZED(
+            frames_number = VAL_FRAMES,
+            frame_rate    = fps,
+            batch_size    = 1,
+            audio_vae     = get_value_at_index(_audio_vae_obj, 0),
+        )
+        del _audio_vae_obj
+        MEM.soft_cleanup()
+        MEM.print_memory("VALIDATION — after latents created")
+
+        # ── LTXVConcatAVLatent ─────────────────────────────────────────────────
+        _concat_av = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
+        _av_latent = _concat_av.EXECUTE_NORMALIZED(
+            video_latent = get_value_at_index(_vid_latent_empty, 0),
+            audio_latent = get_value_at_index(_aud_latent_empty, 0),
+        )
+        del _vid_latent_empty, _aud_latent_empty
+
+        # ── Stage 1: KSamplerSelect + BasicScheduler + CFGGuider + RandomNoise ─
+        _ks1  = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
+        _samp1= _ks1.EXECUTE_NORMALIZED(sampler_name="euler")
+
+        _bs1  = NODE_CLASS_MAPPINGS["BasicScheduler"]()
+        _sig1 = _bs1.EXECUTE_NORMALIZED(model=_model, scheduler="linear_quadratic", steps=4, denoise=1.0)
+
+        _cfg1 = NODE_CLASS_MAPPINGS["CFGGuider"]()
+        _g1   = _cfg1.EXECUTE_NORMALIZED(
+            cfg      = 1,
+            model    = _model,
+            positive = get_value_at_index(_cond_out, 0),
+            negative = get_value_at_index(_cond_out, 1),
+        )
+
+        _rn1  = NODE_CLASS_MAPPINGS["RandomNoise"]()
+        _n1   = _rn1.EXECUTE_NORMALIZED(noise_seed=seed)
+
+        print("  [VAL] Stage 1 sampling (4 steps)…")
+        _sampler_node = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
+        _s1_out = _sampler_node.EXECUTE_NORMALIZED(
+            noise        = get_value_at_index(_n1, 0),
+            guider       = get_value_at_index(_g1, 0),
+            sampler      = get_value_at_index(_samp1, 0),
+            sigmas       = get_value_at_index(_sig1, 0),
+            latent_image = get_value_at_index(_av_latent, 0),
+        )
+        del _g1, _av_latent, _sig1, _n1
+        MEM.cleanup()
+        MEM.print_memory("VALIDATION — after Stage 1")
+
+        # ── LTXVSeparateAVLatent ───────────────────────────────────────────────
+        _sep_av = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
+        _sep1   = _sep_av.EXECUTE_NORMALIZED(av_latent=get_value_at_index(_s1_out, 0))
+        _vid1   = get_value_at_index(_sep1, 0)
+        _aud1   = get_value_at_index(_sep1, 1)
+        del _s1_out, _sep1
+        MEM.soft_cleanup()
+
+        # ── Stage 2: upscale + refine ─────────────────────────────────────────
+        print("  [VAL/N36] Loading Video VAE for upsampler…")
+        _vae_loader = NODE_CLASS_MAPPINGS["VAELoader"]()
+        _vid_vae    = _vae_loader.load_vae(vae_name=MODEL_FILENAMES["video_vae"])
+
+        _upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+        _up_model   = _upscale_loader.EXECUTE_NORMALIZED(model_name=MODEL_FILENAMES["spatial_upscaler"])
+
+        _upsampler  = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
+        _up_lat     = _upsampler.upsample_latent(
+            samples       = _vid1,
+            upscale_model = get_value_at_index(_up_model, 0),
+            vae           = get_value_at_index(_vid_vae, 0),
+        )
+        del _up_model
+        MEM.soft_cleanup()
+        MEM.print_memory("VALIDATION — after upscale")
+
+        # ── Concat again for Stage 2 ──────────────────────────────────────────
+        _av2 = _concat_av.EXECUTE_NORMALIZED(
+            video_latent = get_value_at_index(_up_lat, 0),
+            audio_latent = _aud1,
+        )
+        del _vid1, _up_lat
+
+        # ── Stage 2 sampling (4 steps, denoise=0.42) ─────────────────────────
+        _sig2 = _bs1.EXECUTE_NORMALIZED(model=_model, scheduler="linear_quadratic", steps=4, denoise=0.42)
+        _g2   = _cfg1.EXECUTE_NORMALIZED(
+            cfg      = 1,
+            model    = _model,
+            positive = get_value_at_index(_cond_out, 0),
+            negative = get_value_at_index(_cond_out, 1),
+        )
+        _n2   = _rn1.EXECUTE_NORMALIZED(noise_seed=0)
+
+        print("  [VAL] Stage 2 sampling (4 steps, denoise=0.42)…")
+        _s2_out = _sampler_node.EXECUTE_NORMALIZED(
+            noise        = get_value_at_index(_n2, 0),
+            guider       = get_value_at_index(_g2, 0),
+            sampler      = get_value_at_index(_samp1, 0),
+            sigmas       = get_value_at_index(_sig2, 0),
+            latent_image = get_value_at_index(_av2, 0),
+        )
+        del _g2, _av2, _sig2, _n2, _cond_out
+        MEM.cleanup()
+        MEM.print_memory("VALIDATION — after Stage 2")
+
+        # ── Final separate ─────────────────────────────────────────────────────
+        _sep2           = _sep_av.EXECUTE_NORMALIZED(av_latent=get_value_at_index(_s2_out, 0))
+        _final_vid_lat  = get_value_at_index(_sep2, 0)
+        _final_aud_lat  = get_value_at_index(_sep2, 1)
+        del _s2_out, _sep2
+
+        # Offload UNet
+        del _model
+        MEM.aggressive_cleanup()
+        MEM.print_memory("VALIDATION — after UNet offload")
+
+    # Return same shape as run_director_workflow()
+    return {
+        "video_latent":        _final_vid_lat,
+        "audio_latent":        _final_aud_lat,
+        "n132_positive":       None,   # no Director guides in validation
+        "n132_negative":       None,
+        "director_frame_rate": float(fps),
+        "audio_vae_name":      MODEL_FILENAMES["audio_vae"],
+        "video_vae_name":      MODEL_FILENAMES["video_vae"],
+        "video_vae_obj":       _vid_vae,   # keep alive for decode
+        "is_validation":       True,
+    }
+
+
 def run_director_workflow(
     total_frames:   int,
     seed:           int,
@@ -2220,19 +2430,17 @@ def run_director_workflow(
     validation_mode:bool = False,
 ) -> dict:
     """
-    Execute the full Director 2.0 generation pipeline (JSON nodes 135 → 22).
-
-    CPU RAM budget (T4 free slot ≈ 4 GB at this point):
-      Step A: Load UNet GGUF only               → moves to GPU on first use
-      Step B: Load CLIP → encode text → DELETE   → frees ~9 GB
-      Step C: Apply LoRAs (model is on GPU)
-      Step D: Run LTXDirector (needs model + clip result)
-      Step E: Stage-1 sampling
-      Step F: Load Video VAE only for upscaler  → load/use/delete
-      Step G: Stage-2 sampling
-      Step H: Keep latents on CPU; return without loading VAEs
-             (VAE decode happens separately in CELL 20 per chunk)
+    Dispatch to run_validation_workflow() for validation passes (lean, no Director).
+    For the full generation run, execute the complete Director 2.0 pipeline.
     """
+    if validation_mode:
+        print("  [validation mode] Using minimal pipeline — bypassing LTXDirector")
+        return run_validation_workflow(
+            total_frames  = total_frames,
+            seed          = seed,
+            global_prompt = global_prompt,
+            fps           = fps,
+        )
     MEM.print_memory("BEFORE GENERATION")
 
     _COMFY = CONFIG["comfyui_dir"]
@@ -2785,16 +2993,21 @@ def decode_video_in_chunks(
             _chunk_latent = {"samples": _chunk_samples}
 
             # ── NODE 54: LTXDirectorCropGuides (crop for upscaled latent) ─────
-            try:
-                _node54 = getattr(ltxdirectorcrop, _crop_func_d)(
-                    positive=n132_positive,
-                    negative=n132_negative,
-                    latent=_chunk_latent,
-                )
-                _decode_input = get_value_at_index(_node54, 2)
-                del _node54
-            except Exception as _e54:
-                print(f"    ⚠️  LTXDirectorCropGuides failed ({_e54}), using raw chunk latent")
+            # Skip when conditioning is None (validation mode has no Director guides)
+            if n132_positive is not None and n132_negative is not None:
+                try:
+                    _node54 = getattr(ltxdirectorcrop, _crop_func_d)(
+                        positive=n132_positive,
+                        negative=n132_negative,
+                        latent=_chunk_latent,
+                    )
+                    _decode_input = get_value_at_index(_node54, 2)
+                    del _node54
+                except Exception as _e54:
+                    print(f"    ⚠️  LTXDirectorCropGuides failed ({_e54}), using raw chunk latent")
+                    _decode_input = _chunk_latent
+            else:
+                # Validation mode: no Director conditioning, decode directly
                 _decode_input = _chunk_latent
 
             # ── NODE 1: VAEDecode ──────────────────────────────────────────────
@@ -3230,11 +3443,12 @@ def run_full_pipeline(
             validation_mode  = validate_only,
         )
 
-    _vid_latent   = _gen_result["video_latent"]
-    _aud_latent   = _gen_result["audio_latent"]
-    _n132_pos     = _gen_result["n132_positive"]
-    _n132_neg     = _gen_result["n132_negative"]
-    _audio_vae_name = _gen_result.get("audio_vae_name", MODEL_FILENAMES["audio_vae"])
+    _vid_latent    = _gen_result["video_latent"]
+    _aud_latent    = _gen_result["audio_latent"]
+    _n132_pos      = _gen_result["n132_positive"]   # None in validation mode
+    _n132_neg      = _gen_result["n132_negative"]   # None in validation mode
+    _audio_vae_name= _gen_result.get("audio_vae_name", MODEL_FILENAMES["audio_vae"])
+    _is_validation = _gen_result.get("is_validation", False)
 
     # ── STEP 2: Audio decode ──────────────────────────────────────────────────
     print("\nSTEP 2 — Decoding audio…")
@@ -3299,16 +3513,19 @@ def run_full_pipeline(
         def _decode_one_chunk(_chunk_lat, _pos, _neg, _vae_name):
             vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
             vaedecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
-            _cc = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
-            _cf = getattr(_cc, "FUNCTION", "run")
-            ltxdirectorcrop = _cc()
             with torch.inference_mode():
-                try:
-                    _n54 = getattr(ltxdirectorcrop, _cf)(positive=_pos, negative=_neg, latent=_chunk_lat)
-                    _decode_input = get_value_at_index(_n54, 2)
-                    del _n54
-                except Exception as _e:
-                    print(f"    ⚠️  CropGuides failed: {_e}")
+                # Skip LTXDirectorCropGuides when conditioning is None (validation mode)
+                if _pos is not None and _neg is not None:
+                    try:
+                        _cc = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+                        _cf = getattr(_cc, "FUNCTION", "execute")
+                        _n54 = _cc().execute(positive=_pos, negative=_neg, latent=_chunk_lat)
+                        _decode_input = get_value_at_index(_n54, 2)
+                        del _n54
+                    except Exception as _e:
+                        print(f"    ⚠️  CropGuides failed: {_e}")
+                        _decode_input = _chunk_lat
+                else:
                     _decode_input = _chunk_lat
                 _vae = vaeloader.load_vae(vae_name=_vae_name)
                 _dec = vaedecode.decode(samples=_decode_input,
