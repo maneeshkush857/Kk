@@ -2686,15 +2686,15 @@ def run_director_workflow(
         MEM.print_memory("after Audio VAE load")
 
         # img_compression=18 runs H.264 encode/decode on every image in PyAV.
-        # Each 1280×720 frame = ~600 MB RAM spike. 5 images = ~3 GB peak inside Director.
-        # During validation pass: skip compression entirely (img_compression=0).
-        # During full run: use the JSON-authoritative value (18).
-        _img_comp = 0 if validation_mode else IMG_COMPRESSION
-        # Also reduce resolution for validation — use 768×448 (same AR as 1280×720)
+        # At 1280×720 × 5 images = ~3 GB transient CPU RAM spike inside Director.
+        # Full run budget: 5.77 GB CPU + 3 GB spike = ~8.8 GB — just within T4 limits.
+        # Use img_compression=0 to skip PyAV entirely and save ~3 GB RAM.
+        # Quality difference is minimal for AI-generated video.
+        _img_comp = 0   # Always 0 — saves 3 GB CPU RAM, no meaningful quality loss
         _val_w = 768 if validation_mode else width
         _val_h = 448 if validation_mode else height
         if validation_mode:
-            print(f"  [validation] img_compression=0, resolution={_val_w}×{_val_h} (RAM-safe)")
+            print(f"  [validation] resolution={_val_w}×{_val_h} (RAM-safe)")
 
         node131 = getattr(_director_node, _director_func)(
             model              = node10_model_out,
@@ -2788,7 +2788,7 @@ def run_director_workflow(
             image_attention_strength = 0.5,   # Stage 1 image_strength=0.5 from JSON
             crop                  = "center",
             auto_snap_ic_grid     = True,
-            use_tiled_encode      = False,
+            use_tiled_encode      = True,     # T4 safety: tile VAE encode to reduce peak VRAM
             tile_size             = 256,
             tile_overlap          = 64,
             retake_mode           = False,
@@ -2918,7 +2918,7 @@ def run_director_workflow(
             image_attention_strength = 1.0,   # Stage 2 image_strength=1.0 from JSON
             crop                  = "center",
             auto_snap_ic_grid     = True,
-            use_tiled_encode      = False,
+            use_tiled_encode      = True,     # T4 safety: tile VAE encode
             tile_size             = 256,
             tile_overlap          = 64,
             retake_mode           = False,
