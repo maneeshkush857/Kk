@@ -2479,9 +2479,11 @@ def run_validation_workflow(
             upscale_model = get_value_at_index(_up_model, 0),
             vae           = get_value_at_index(_vid_vae, 0),
         )
-        del _up_model
-        MEM.soft_cleanup()
-        MEM.print_memory("VALIDATION — after upscale")
+        # CRITICAL: delete VAE + upscale model immediately after use
+        # to free ~2.3 GB VRAM before Stage 2 sampling
+        del _up_model, _vid_vae
+        MEM.aggressive_cleanup()
+        MEM.print_memory("VALIDATION — after upscale (VAE freed)")
 
         # ── Concat again for Stage 2 ──────────────────────────────────────────
         _av2 = _concat_av.EXECUTE_NORMALIZED(
@@ -2533,7 +2535,6 @@ def run_validation_workflow(
         "director_frame_rate": float(fps),
         "audio_vae_name":      MODEL_FILENAMES["audio_vae"],
         "video_vae_name":      MODEL_FILENAMES["video_vae"],
-        "video_vae_obj":       _vid_vae,   # keep alive for decode
         "is_validation":       True,
     }
 
@@ -2971,7 +2972,10 @@ def run_director_workflow(
         n132_model    = get_value_at_index(node132, 3)
 
         del node14, node55, node36_video_vae
-        MEM.soft_cleanup()
+        # Aggressive cleanup: evict Video VAE from GPU before Stage 2 sampling
+        # This frees ~1.4 GB VRAM so Stage 2 sampler has enough headroom
+        MEM.aggressive_cleanup()
+        MEM.print_memory("after VAE freed pre-Stage2")
 
         # ── NODE 18: LTXVConcatAVLatent (Stage 2) ────────────────────────────
         print("  [N18]  LTXVConcatAVLatent (Stage 2)…")
