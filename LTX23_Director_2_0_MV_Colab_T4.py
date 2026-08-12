@@ -2216,6 +2216,7 @@ def run_director_workflow(
     height:         int,
     input_images:   list,
     input_audio:    str | None,
+    skip_loras:     bool = False,
 ) -> dict:
     """
     Execute the full Director 2.0 generation pipeline (JSON nodes 135 → 22).
@@ -2260,10 +2261,19 @@ def run_director_workflow(
         MEM.print_memory("after CLIP load")
 
         # ── STEP C: Apply LoRAs ───────────────────────────────────────────────
-        print("  [N138] Applying LoRA stack (Power Lora Loader)…")
-        _lora_model = LORA_MANAGER.apply_loras(_raw_model)
-        del _raw_model
-        MEM.cleanup()
+        # LoRAs are large (dynamic=2.4GB, OmniNFT=0.6GB, transition=0.4GB, MVCamera=0.4GB)
+        # During validation pass we skip them to conserve CPU RAM.
+        # For full run they load one at a time directly into the model on GPU.
+        if skip_loras:
+            print("  [N138] LoRA stack SKIPPED (validation pass — saving ~3.8 GB RAM)")
+            _lora_model = _raw_model
+            del _raw_model
+        else:
+            print("  [N138] Applying LoRA stack (Power Lora Loader)…")
+            _lora_model = LORA_MANAGER.apply_loras(_raw_model)
+            del _raw_model
+            MEM.cleanup()
+            MEM.print_memory("after LoRAs applied")
 
         # ── STEP D-prep: ModelPreviewOverrideKJ (skip tiny VAE — saves ~100 MB)
         print("  [N10] ModelPreviewOverrideKJ…")
@@ -2375,6 +2385,13 @@ def run_director_workflow(
         _timeline_json = json.dumps(_timeline_dict)
 
         # ── Load Audio VAE just before LTXDirector (then delete) ─────────────
+        # IMPORTANT: Delete CLIP first to free ~2.5 GB before loading Audio VAE
+        # and before LTXDirector processes the 5 images (another ~0.5–1 GB peak).
+        print("  Freeing CLIP from RAM before Audio VAE + Director…")
+        del node12_clip
+        MEM.aggressive_cleanup()
+        MEM.print_memory("after CLIP freed")
+
         # Loading here (not at the top) keeps RAM free while CLIP was resident.
         print("  [N8]  Loading Audio VAE (lazy)…")
         vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
@@ -2434,10 +2451,10 @@ def run_director_workflow(
 
         MEM.print_memory("after LTXDirector")
 
-        # Free CLIP and Audio VAE — no longer needed after Director output
-        del node12_clip, node8_audio_vae, node131
+        # Free Audio VAE and node131 result — Director output tensors are now unpacked
+        del node8_audio_vae, node131
         MEM.aggressive_cleanup()
-        MEM.print_memory("after CLIP+AudioVAE freed")
+        MEM.print_memory("after AudioVAE+Director freed")
 
         # ── NODE 128: ConditioningZeroOut ─────────────────────────────────────
         print("  [N128] ConditioningZeroOut…")
@@ -3181,6 +3198,7 @@ def run_full_pipeline(
                 height        = CONFIG["height"],
                 input_images  = CONFIG["input_images"],
                 input_audio   = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
+                skip_loras    = validate_only,  # skip heavy LoRAs during 3s validation pass
             )
         except torch.cuda.OutOfMemoryError as oom:
             _report_oom_error("generation", 0, "SamplerCustomAdvanced", _cfg_frames, oom)
@@ -3208,6 +3226,7 @@ def run_full_pipeline(
             height        = CONFIG["height"],
             input_images  = CONFIG["input_images"],
             input_audio   = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
+            skip_loras    = validate_only,
         )
 
     _vid_latent   = _gen_result["video_latent"]
