@@ -963,24 +963,24 @@ def import_custom_nodes() -> None:
     # ── Patch 1: PromptServer stub ────────────────────────────────────────────
     try:
         import server as _srv
-        if _srv.PromptServer.instance is None:
-            class _FakeRoutes:
-                def get(self, *a, **kw):
-                    def _dec(fn): return fn
-                    return _dec
-                def post(self, *a, **kw):
-                    def _dec(fn): return fn
-                    return _dec
-            class _FakeQueue:
-                pass
-            class _FakeServer:
-                routes = _FakeRoutes()
-                prompt_queue = _FakeQueue()
-                app = None
-            _srv.PromptServer.instance = _FakeServer()
-            print("  [patch] PromptServer.instance stub injected")
+        class _FakeRoutes:
+            def get(self, *a, **kw):
+                def _dec(fn): return fn
+                return _dec
+            def post(self, *a, **kw):
+                def _dec(fn): return fn
+                return _dec
+        class _FakeQueue:
+            pass
+        class _FakeServer:
+            routes = _FakeRoutes()
+            prompt_queue = _FakeQueue()
+            app = None
+        # Always set — regardless of whether instance exists or is None
+        _srv.PromptServer.instance = _FakeServer()
+        print("  [patch] PromptServer.instance stub injected ✓")
     except Exception as _pe:
-        print(f"  [patch] PromptServer patch skipped: {_pe}")
+        print(f"  [patch] PromptServer patch failed: {_pe}")
 
     # ── Patch 2: kornia pyramid pad shim ──────────────────────────────────────
     try:
@@ -2214,8 +2214,17 @@ def run_director_workflow(
 ) -> dict:
     """
     Execute the full Director 2.0 generation pipeline (JSON nodes 135 → 22).
-    Returns dict with keys: video_latent, audio_latent, conditioning, director_out
-    All heavy models are offloaded after their stage completes.
+
+    CPU RAM budget (T4 free slot ≈ 4 GB at this point):
+      Step A: Load UNet GGUF only               → moves to GPU on first use
+      Step B: Load CLIP → encode text → DELETE   → frees ~9 GB
+      Step C: Apply LoRAs (model is on GPU)
+      Step D: Run LTXDirector (needs model + clip result)
+      Step E: Stage-1 sampling
+      Step F: Load Video VAE only for upscaler  → load/use/delete
+      Step G: Stage-2 sampling
+      Step H: Keep latents on CPU; return without loading VAEs
+             (VAE decode happens separately in CELL 20 per chunk)
     """
     MEM.print_memory("BEFORE GENERATION")
 
@@ -2223,37 +2232,19 @@ def run_director_workflow(
 
     with torch.inference_mode():
 
-        # ── NODE 8: VAELoader — Audio VAE ─────────────────────────────────────
-        print("  [N8]  Loading Audio VAE…")
-        vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
-        node8_audio_vae = vaeloader.load_vae(
-            vae_name=MODEL_FILENAMES["audio_vae"]
-        )
-        MEM.print_memory("after audio VAE load")
-
-        # ── NODE 36: VAELoader — Video VAE ────────────────────────────────────
-        print("  [N36] Loading Video VAE…")
-        node36_video_vae = vaeloader.load_vae(
-            vae_name=MODEL_FILENAMES["video_vae"]
-        )
-        MEM.print_memory("after video VAE load")
-
-        # ── NODE 6: VAELoaderKJ — Tiny preview VAE ────────────────────────────
-        print("  [N6]  Loading Tiny VAE (preview)…")
-        node6_tiny_vae = load_audio_vae_compat(MODEL_FILENAMES["taeltx23"])
-        MEM.print_memory("after tiny VAE load")
-
-        # ── NODE 135: UnetLoaderGGUF ──────────────────────────────────────────
+        # ── STEP A: Load UNet GGUF (moves to GPU during inference) ───────────
         print("  [N135] Loading UNet GGUF…")
         unetloadergguf = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
         node135_model = unetloadergguf.load_unet(
             unet_name=MODEL_FILENAMES["ltx23_unet"]
         )
         _raw_model = get_value_at_index(node135_model, 0)
+        del node135_model
         MEM.print_memory("after UNet load")
 
-        # ── NODE 12: DualCLIPLoader ───────────────────────────────────────────
-        print("  [N12] Loading DualCLIPLoader…")
+        # ── STEP B: Load CLIP, encode, then immediately DELETE ────────────────
+        # Gemma 12B FP4 ≈ 9 GB. Load → encode → delete before loading VAEs.
+        print("  [N12] Loading DualCLIPLoader (Gemma FP4 + LTX projection)…")
         dualcliploader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
         node12_clip = dualcliploader.load_clip(
             clip_name1=MODEL_FILENAMES["gemma_fp4"],
@@ -2263,23 +2254,20 @@ def run_director_workflow(
         )
         MEM.print_memory("after CLIP load")
 
-        # ── NODE 138: Power Lora Loader (rgthree) — apply 4 LoRAs ────────────
+        # ── STEP C: Apply LoRAs ───────────────────────────────────────────────
         print("  [N138] Applying LoRA stack (Power Lora Loader)…")
         _lora_model = LORA_MANAGER.apply_loras(_raw_model)
         del _raw_model
-        MEM.soft_cleanup()
+        MEM.cleanup()
 
-        # ── NODE 10: ModelPreviewOverrideKJ ───────────────────────────────────
-        # Wraps model with tiny VAE preview — node 10 widget: [0, 80, True, 240, 24, ""]
+        # ── STEP D-prep: ModelPreviewOverrideKJ (skip tiny VAE — saves ~100 MB)
         print("  [N10] ModelPreviewOverrideKJ…")
         node10_model_out = _lora_model
         if "ModelPreviewOverrideKJ" in NODE_CLASS_MAPPINGS:
             try:
                 _preview_node = NODE_CLASS_MAPPINGS["ModelPreviewOverrideKJ"]()
-                # Discover actual FUNCTION name from the node class
                 _func_name = getattr(_preview_node.__class__, "FUNCTION", None)
                 if _func_name is None:
-                    # Try common names used by KJNodes
                     for _fn in ("patch", "apply", "apply_model", "EXECUTE_NORMALIZED", "run", "execute"):
                         if hasattr(_preview_node, _fn):
                             _func_name = _fn
@@ -2287,38 +2275,21 @@ def run_director_workflow(
                 if _func_name and hasattr(_preview_node, _func_name):
                     _call = getattr(_preview_node, _func_name)
                     try:
-                        _n10 = _call(
-                            model=_lora_model,
-                            vae=get_value_at_index(node6_tiny_vae, 0),
-                            preview_start=0,
-                            preview_end=80,
-                            enabled=True,
-                            resolution=240,
-                            frame_rate=24,
-                            prompt="",
-                        )
+                        # Try without tiny VAE first (saves ~100 MB RAM)
+                        _n10 = _call(model=_lora_model, enabled=False)
                     except TypeError:
-                        # Some versions don't accept all kwargs — try positional
-                        _n10 = _call(model=_lora_model)
+                        try:
+                            _n10 = _call(model=_lora_model)
+                        except Exception:
+                            _n10 = (_lora_model,)
                     node10_model_out = get_value_at_index(_n10, 0)
                     del _n10
-                else:
-                    print(f"    ⚠️  ModelPreviewOverrideKJ: no callable FUNCTION found, skipping")
             except Exception as _e10:
-                print(f"    ⚠️  ModelPreviewOverrideKJ failed ({_e10}), using raw model")
-                node10_model_out = _lora_model
+                print(f"    ⚠️  ModelPreviewOverrideKJ: {_e10} — using raw model")
         else:
-            print("    ⚠️  ModelPreviewOverrideKJ not in registry — skipping preview wrap")
+            print("    ModelPreviewOverrideKJ not registered — skipping")
 
-        # Free tiny VAE after preview setup (not needed for generation)
-        del node6_tiny_vae
-        MEM.soft_cleanup()
-
-        # ── NODE 131: LTXDirector — master timeline orchestrator ──────────────
-        # Inputs: model (N10), clip (N12), audio_vae (N8)
-        # Optional: optional_latent=None, global_prompt passed as property
-        # Outputs: [model, positive, video_latent, audio_latent, guide_data,
-        #           motion_guide_data, frame_rate, combined_audio]
+        # ── STEP D: Run LTXDirector ───────────────────────────────────────────
         print("  [N131] LTXDirector — building timeline…")
         print(f"         frames={total_frames}, fps={fps}, {width}×{height}")
 
@@ -2398,6 +2369,13 @@ def run_director_workflow(
         }
         _timeline_json = json.dumps(_timeline_dict)
 
+        # ── Load Audio VAE just before LTXDirector (then delete) ─────────────
+        # Loading here (not at the top) keeps RAM free while CLIP was resident.
+        print("  [N8]  Loading Audio VAE (lazy)…")
+        vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
+        node8_audio_vae = vaeloader.load_vae(vae_name=MODEL_FILENAMES["audio_vae"])
+        MEM.print_memory("after Audio VAE load")
+
         # Call LTXDirector with the full parameter set matching JSON node 131
         node131 = getattr(_director_node, _director_func)(
             model=node10_model_out,
@@ -2441,9 +2419,10 @@ def run_director_workflow(
 
         MEM.print_memory("after LTXDirector")
 
-        # Free N12 CLIP after Director consumed it
-        del node12_clip
-        MEM.soft_cleanup()
+        # Free CLIP and Audio VAE — no longer needed after Director output
+        del node12_clip, node8_audio_vae, node131
+        MEM.aggressive_cleanup()
+        MEM.print_memory("after CLIP+AudioVAE freed")
 
         # ── NODE 128: ConditioningZeroOut ─────────────────────────────────────
         print("  [N128] ConditioningZeroOut…")
@@ -2462,6 +2441,11 @@ def run_director_workflow(
         # ── NODE 133: LTXDirectorGuide STAGE 1 ───────────────────────────────
         # JSON widget values: None,1,0.5,bicubic,1,center,True,False,256,64,False
         print("  [N133] LTXDirectorGuide (Stage 1)…")
+        # Load Video VAE lazily here — CLIP has been freed, so we have headroom
+        print("  [N36] Loading Video VAE (lazy — after CLIP freed)…")
+        node36_video_vae = vaeloader.load_vae(vae_name=MODEL_FILENAMES["video_vae"])
+        MEM.print_memory("after Video VAE load")
+
         _guide_cls  = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
         _guide_func = getattr(_guide_cls, "FUNCTION", "run")
         ltxdirectorguide = _guide_cls()
@@ -2680,13 +2664,16 @@ def run_director_workflow(
         MEM.print_memory("after UNet offload")
 
     # Return lightweight references only — latents stay CPU-pinned
+    # Audio VAE is loaded fresh in decode_audio() — don't carry it here
     return {
-        "video_latent":     final_vid_latent,
-        "audio_latent":     final_aud_latent,
-        "n132_positive":    n132_positive,
-        "n132_negative":    n132_negative,
-        "node8_audio_vae":  node8_audio_vae,   # still needed for audio VAE decode
+        "video_latent":        final_vid_latent,
+        "audio_latent":        final_aud_latent,
+        "n132_positive":       n132_positive,
+        "n132_negative":       n132_negative,
         "director_frame_rate": director_frame_rate,
+        # node8_audio_vae was freed — decode_audio() loads it fresh
+        "audio_vae_name":      MODEL_FILENAMES["audio_vae"],
+        "video_vae_name":      MODEL_FILENAMES["video_vae"],
     }
 
 
@@ -2797,21 +2784,24 @@ def decode_video_in_chunks(
     return decoded_chunks
 
 
-def decode_audio(audio_latent, node8_audio_vae) -> Any:
+def decode_audio(audio_latent, audio_vae_name: str) -> Any:
     """
     JSON: Node 24 — LTXVAudioVAEDecode
+    Loads Audio VAE fresh (it was freed after LTXDirector to save RAM).
     Decode the audio latent. Returns AUDIO output on CPU.
     """
-    print("  [N24]  LTXVAudioVAEDecode…")
+    print("  [N24]  LTXVAudioVAEDecode (loading Audio VAE fresh)…")
     with torch.inference_mode():
+        # Load Audio VAE fresh — CLIP and other models are now freed
+        _audio_vae_obj = NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=audio_vae_name)
         ltxvaudiovaedecode = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
         _audio_out = ltxvaudiovaedecode.EXECUTE_NORMALIZED(
             samples=audio_latent,
-            audio_vae=get_value_at_index(node8_audio_vae, 0),
+            audio_vae=get_value_at_index(_audio_vae_obj, 0),
         )
         _audio = get_value_at_index(_audio_out, 0)
-        del _audio_out
-        MEM.soft_cleanup()
+        del _audio_out, _audio_vae_obj
+        MEM.cleanup()
     return _audio
 
 
@@ -3202,15 +3192,15 @@ def run_full_pipeline(
     _aud_latent   = _gen_result["audio_latent"]
     _n132_pos     = _gen_result["n132_positive"]
     _n132_neg     = _gen_result["n132_negative"]
-    _audio_vae    = _gen_result["node8_audio_vae"]
+    _audio_vae_name = _gen_result.get("audio_vae_name", MODEL_FILENAMES["audio_vae"])
 
     # ── STEP 2: Audio decode ──────────────────────────────────────────────────
     print("\nSTEP 2 — Decoding audio…")
     CHECKPOINT["stage"] = "audio_decode"
     save_checkpoint(CHECKPOINT)
 
-    _audio_out = decode_audio(_aud_latent, _audio_vae)
-    del _aud_latent, _audio_vae
+    _audio_out = decode_audio(_aud_latent, _audio_vae_name)
+    del _aud_latent
     MEM.cleanup()
     print("  Audio decoded ✓")
 
