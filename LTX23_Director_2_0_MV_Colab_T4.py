@@ -981,6 +981,9 @@ def import_custom_nodes() -> None:
             prompt_queue = _FakeQueue()
             app = _FakeApp()
             node_replace_manager = None
+            last_node_id = None
+            last_prompt_id = None
+            client_id = None
         # Always set — regardless of whether instance exists or is None
         _srv.PromptServer.instance = _FakeServer()
         print("  [patch] PromptServer.instance stub injected ✓")
