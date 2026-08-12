@@ -2334,12 +2334,14 @@ def run_validation_workflow(
 ) -> dict:
     """
     Minimal pipeline for the 3-second validation pass.
-    Does NOT use LTXDirector — uses the same lean pattern as ltx2_ti2v.py:
-      UNet → CLIP → CLIPTextEncode → del CLIP → ConditioningZeroOut
-      → LTXVConditioning → EmptyLTXVLatentVideo → LTXVEmptyLatentAudio
-      → LTXVConcatAVLatent → SamplerCustomAdvanced → LTXVSeparateAVLatent
-    Peak CPU RAM: ~3 GB total. Never crashes Colab T4.
-    Returns the same dict shape as run_director_workflow().
+    Does NOT use LTXDirector — uses the same lean pattern as ltx2_ti2v.py.
+    IMPORTANT: Skips Stage 2 (upscale + refine) entirely — Stage 2 requires
+    loading the Video VAE while the 11 GB UNet is still on GPU, leaving only
+    3.4 GB free which is not enough for the upscaled latent sampling.
+    Validation only needs to prove the pipeline plumbing works, not quality.
+    Pipeline: UNet → CLIP → encode → del CLIP → condition → empty latent
+              → Stage 1 sample (4 steps) → separate → del UNet → decode
+    Peak GPU: ~12.95 GB during Stage 1. Fits on T4 16 GB.
     """
     # Compact validation resolution: same aspect ratio, much smaller
     VAL_W, VAL_H = 576, 320   # 576×320 @ 1.8:1 AR — fits comfortably in T4 RAM
@@ -2465,63 +2467,18 @@ def run_validation_workflow(
         del _s1_out, _sep1
         MEM.soft_cleanup()
 
-        # ── Stage 2: upscale + refine ─────────────────────────────────────────
-        print("  [VAL/N36] Loading Video VAE for upsampler…")
-        _vae_loader = NODE_CLASS_MAPPINGS["VAELoader"]()
-        _vid_vae    = _vae_loader.load_vae(vae_name=MODEL_FILENAMES["video_vae"])
+        # ── Stage 2: SKIPPED in validation ───────────────────────────────────
+        # After Stage 1, the UNet is still resident (12.95 GB).
+        # Loading Video VAE (1.38 GB) + upscaler (0.9 GB) + upscaled latent
+        # leaves only ~3.4 GB free — not enough for Stage 2 sampling (needs ~4+ GB).
+        # Validation only needs to verify end-to-end pipeline plumbing.
+        # Use Stage 1 output directly for VAE decode.
+        print("  [VAL] Skipping Stage 2 upscale — using Stage 1 output for decode")
+        _final_vid_lat = _vid1
+        _final_aud_lat = _aud1
+        del _vid1, _aud1, _cond_out
 
-        _upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-        _up_model   = _upscale_loader.EXECUTE_NORMALIZED(model_name=MODEL_FILENAMES["spatial_upscaler"])
-
-        _upsampler  = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-        _up_lat     = _upsampler.upsample_latent(
-            samples       = _vid1,
-            upscale_model = get_value_at_index(_up_model, 0),
-            vae           = get_value_at_index(_vid_vae, 0),
-        )
-        # CRITICAL: delete VAE + upscale model immediately after use
-        # to free ~2.3 GB VRAM before Stage 2 sampling
-        del _up_model, _vid_vae
-        MEM.aggressive_cleanup()
-        MEM.print_memory("VALIDATION — after upscale (VAE freed)")
-
-        # ── Concat again for Stage 2 ──────────────────────────────────────────
-        _av2 = _concat_av.EXECUTE_NORMALIZED(
-            video_latent = get_value_at_index(_up_lat, 0),
-            audio_latent = _aud1,
-        )
-        del _vid1, _up_lat
-
-        # ── Stage 2 sampling (4 steps, denoise=0.42) ─────────────────────────
-        _sig2 = _bs1.EXECUTE_NORMALIZED(model=_model, scheduler="linear_quadratic", steps=4, denoise=0.42)
-        _g2   = _cfg1.EXECUTE_NORMALIZED(
-            cfg      = 1,
-            model    = _model,
-            positive = get_value_at_index(_cond_out, 0),
-            negative = get_value_at_index(_cond_out, 1),
-        )
-        _n2   = _rn1.EXECUTE_NORMALIZED(noise_seed=0)
-
-        print("  [VAL] Stage 2 sampling (4 steps, denoise=0.42)…")
-        MEM.pre_sampling_cleanup()
-        _s2_out = _sampler_node.EXECUTE_NORMALIZED(
-            noise        = get_value_at_index(_n2, 0),
-            guider       = get_value_at_index(_g2, 0),
-            sampler      = get_value_at_index(_samp1, 0),
-            sigmas       = get_value_at_index(_sig2, 0),
-            latent_image = get_value_at_index(_av2, 0),
-        )
-        del _g2, _av2, _sig2, _n2, _cond_out
-        MEM.cleanup()
-        MEM.print_memory("VALIDATION — after Stage 2")
-
-        # ── Final separate ─────────────────────────────────────────────────────
-        _sep2           = _sep_av.EXECUTE_NORMALIZED(av_latent=get_value_at_index(_s2_out, 0))
-        _final_vid_lat  = get_value_at_index(_sep2, 0)
-        _final_aud_lat  = get_value_at_index(_sep2, 1)
-        del _s2_out, _sep2
-
-        # Offload UNet
+        # Offload UNet immediately after Stage 1
         del _model
         MEM.aggressive_cleanup()
         MEM.print_memory("VALIDATION — after UNet offload")
