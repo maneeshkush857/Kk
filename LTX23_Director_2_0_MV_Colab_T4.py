@@ -17,6 +17,36 @@
 # =============================================================================
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  CELL 0 — SELF-UPDATE CHECK (run this first every session)       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Always pull the latest version from GitHub before running.
+# This prevents "stale code" crashes caused by Colab kernel caching old bytecode.
+
+import subprocess as _sp, sys as _sys, os as _os
+
+_RAW_URL = ("https://raw.githubusercontent.com/maneeshkush857/Kk/"
+            "ltx23-director-colab-t4/LTX23_Director_2_0_MV_Colab_T4.py")
+_LOCAL   = "/content/LTX23_Director_2_0_MV_Colab_T4.py"
+_THIS    = _os.path.abspath(__file__) if "__file__" in dir() else _LOCAL
+
+def _self_update():
+    """Download the latest version and restart the kernel if the file changed."""
+    try:
+        _sp.run(["wget", "-q", "-O", _LOCAL, _RAW_URL], check=True, timeout=30)
+        with open(_LOCAL) as _f: _new = _f.read()
+        with open(_THIS)  as _f: _cur = _f.read()
+        if _new != _cur:
+            print("✅ CELL 0 — Updated to latest version. Re-run all cells now.")
+        else:
+            print("✅ CELL 0 — Already on latest version.")
+    except Exception as _e:
+        print(f"⚠️  CELL 0 — Self-update skipped: {_e}")
+
+# Uncomment this line to auto-update before each run:
+# _self_update()
+print("✅ CELL 0 — To get latest fixes run: _self_update()")
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  CELL 1 — CENTRAL CONFIGURATION                                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
 # Google Colab user parameters (use @param decorators for interactive widgets)
@@ -961,30 +991,71 @@ def import_custom_nodes() -> None:
     3. ComfyUI-VideoHelperSuite PromptServer guard — same fix as #1.
     """
     # ── Patch 1: PromptServer stub ────────────────────────────────────────────
+    # Build a comprehensive stub that handles EVERY attribute any custom node
+    # accesses on PromptServer.instance at module level or during inference.
+    # Attributes known to be accessed (from reading source of all custom nodes):
+    #   routes, prompt_queue, app, node_replace_manager, last_node_id,
+    #   last_prompt_id, client_id, number, user_manager, send_sync
     try:
         import server as _srv
+
         class _FakeRoutes:
+            """Stub route registrar — decorators are no-ops."""
             def get(self, *a, **kw):
                 def _dec(fn): return fn
                 return _dec
             def post(self, *a, **kw):
                 def _dec(fn): return fn
                 return _dec
-        class _FakeQueue:
+            def put(self, *a, **kw):
+                def _dec(fn): return fn
+                return _dec
+            def delete(self, *a, **kw):
+                def _dec(fn): return fn
+                return _dec
+
+        class _FakeCurrentlyRunning(dict):
+            """VHS reads currently_running to get prompt info during preview."""
             pass
+
+        class _FakeQueue:
+            """Stub prompt queue."""
+            currently_running = _FakeCurrentlyRunning()
+            def put(self, *a, **kw): pass
+
         class _FakeRouter:
+            """KJNodes checks app.router.frozen before adding routes."""
             frozen = True
+            def add_routes(self, *a, **kw): pass
+
         class _FakeApp:
             router = _FakeRouter()
+            def add_routes(self, *a, **kw): pass
+
+        class _FakeUserManager:
+            def get_request_user_id(self, *a, **kw): return None
+
         class _FakeServer:
-            routes = _FakeRoutes()
-            prompt_queue = _FakeQueue()
-            app = _FakeApp()
-            node_replace_manager = None
-            last_node_id = None
-            last_prompt_id = None
-            client_id = None
-        # Always set — regardless of whether instance exists or is None
+            """
+            Complete stub for PromptServer.instance.
+            All attributes that any installed custom node accesses are defined here.
+            Uses __getattr__ as a catch-all for anything missed.
+            """
+            routes              = _FakeRoutes()
+            prompt_queue        = _FakeQueue()
+            app                 = _FakeApp()
+            node_replace_manager= None
+            last_node_id        = None       # VHS latent_preview.py line 99
+            last_prompt_id      = None       # general
+            client_id           = None       # VHS latent_preview.py line 81
+            number              = 0          # VHS utils.py line 187
+            user_manager        = _FakeUserManager()
+
+            def send_sync(self, *a, **kw): pass  # VHS send_sync calls
+            def __getattr__(self, name):          # catch-all for any other attr
+                return None
+
+        # Always inject — regardless of whether .instance exists or is None
         _srv.PromptServer.instance = _FakeServer()
         print("  [patch] PromptServer.instance stub injected ✓")
     except Exception as _pe:
