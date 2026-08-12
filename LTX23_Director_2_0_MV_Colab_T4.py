@@ -142,34 +142,6 @@ CONFIG = {
     # ── Global prompt (from JSON LTXDirector node 131 property) ─────────────
     "global_prompt": global_prompt,
 }
-        "body proportions, and overall appearance exactly as in the reference image. "
-        "The singer must remain fully recognizable throughout the entire video with absolutely "
-        "no identity drift.\n\n"
-        "The person is performing directly to the camera as a world-class pop, hip-hop and rap "
-        "singer during a sold-out stadium concert. Generate perfectly synchronized lip movements "
-        "from the provided lyrics or audio.\n\n"
-        "drclipz, Aggressive cinematic music video camera. Fast push-in, fast pull-back, "
-        "energetic handheld movement, rhythmic tracking shots, dynamic low-angle hero shots, "
-        "occasional close-ups on emotional lyrics, subtle orbit around the singer, "
-        "cinematic motion blur. Camera movement follows the beat and amplifies the performance.\n\n"
-        "Premium concert lighting with cinematic key light, colorful neon rim lights, "
-        "volumetric atmosphere, dramatic contrast, realistic skin tones, "
-        "vibrant electronic music video mood.\n\n"
-        "Photorealistic, blockbuster-quality AI music video, premium live concert performance, "
-        "ultra-high facial fidelity, charismatic superstar, emotionally captivating, "
-        "explosive stage energy, bold movement, powerful attitude, modern pop, hip-hop and rap "
-        "performance, every second feels alive, impossible to look away.\n\n"
-        "Spoken dialogue:\n"
-        "\"Open up the canvas, blank space on my screen.\n"
-        "Drag a Checkpoint Loader, you know what I mean.\n"
-        "KSampler in the middle, VAE on the right,\n"
-        "Put the Text Encoder, yeah, building tonight.\n"
-        "Connect the nodes, run the queue,\n"
-        "Watch the latent flow right through.\n"
-        "Green, nothing green, nothing yellow,\n"
-        "Positive Prompt, in my hub.\""
-    ),
-}
 
 # Workspace sub-directories
 import os
