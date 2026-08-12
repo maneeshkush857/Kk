@@ -972,10 +972,15 @@ def import_custom_nodes() -> None:
                 return _dec
         class _FakeQueue:
             pass
+        class _FakeRouter:
+            frozen = True
+        class _FakeApp:
+            router = _FakeRouter()
         class _FakeServer:
             routes = _FakeRoutes()
             prompt_queue = _FakeQueue()
-            app = None
+            app = _FakeApp()
+            node_replace_manager = None
         # Always set — regardless of whether instance exists or is None
         _srv.PromptServer.instance = _FakeServer()
         print("  [patch] PromptServer.instance stub injected ✓")
@@ -2376,36 +2381,43 @@ def run_director_workflow(
         node8_audio_vae = vaeloader.load_vae(vae_name=MODEL_FILENAMES["audio_vae"])
         MEM.print_memory("after Audio VAE load")
 
-        # Call LTXDirector with the full parameter set matching JSON node 131
+        # Call LTXDirector with the EXACT parameter set from ltx_director.py execute()
+        # FUNCTION = "execute" — called via EXECUTE_NORMALIZED wrapper
+        # Signature (from source): model, clip, audio_vae, optional_latent, global_prompt,
+        #   start_second, end_second, duration_seconds, start_frame, end_frame, duration_frames,
+        #   timeline_data, local_prompts, segment_lengths, epsilon, guide_strength,
+        #   mainTrackEnabled, audioTrackEnabled, motionTrackEnabled, frame_rate, display_mode,
+        #   custom_width, custom_height, resize_method, divisible_by, img_compression,
+        #   override_audio, timeline_ui
         node131 = getattr(_director_node, _director_func)(
-            model=node10_model_out,
-            clip=get_value_at_index(node12_clip, 0),
-            audio_vae=get_value_at_index(node8_audio_vae, 0),
-            optional_latent=None,
-            global_prompt=None,   # embedded in timeline_data
-            start_second=0,
-            end_second=total_frames / fps,
-            duration_seconds=total_frames / fps,
-            start_frame=0,
-            end_frame=total_frames,
-            duration_frames=total_frames,
-            timeline_data=_timeline_json,
-            local_prompts=" |  |  |  | ",
-            segment_lengths=",".join(str(round(x, 4)) for x in _seg_lengths),
-            epsilon=0.001,
-            guide_strength="1.00,1.00,1.00,1.00,1.00",
-            mainTrackEnabled=True,
-            audioTrackEnabled=True,
-            motionTrackEnabled=True,
-            frame_rate=fps,
-            display_mode="seconds",
-            custom_width=width,
-            custom_height=height,
-            resize_method="maintain aspect ratio",
-            divisible_by=32,
-            img_compression=IMG_COMPRESSION,
-            override_audio=False,
-            timeline_ui="",
+            model             = node10_model_out,
+            clip              = get_value_at_index(node12_clip, 0),
+            audio_vae         = get_value_at_index(node8_audio_vae, 0),
+            optional_latent   = None,
+            global_prompt     = None,
+            start_second      = 0.0,
+            end_second        = float(total_frames) / fps,
+            duration_seconds  = float(total_frames) / fps,
+            start_frame       = 0,
+            end_frame         = total_frames,
+            duration_frames   = total_frames,
+            timeline_data     = _timeline_json,
+            local_prompts     = " |  |  |  | ",
+            segment_lengths   = ",".join(str(round(x, 4)) for x in _seg_lengths),
+            epsilon           = 0.001,
+            guide_strength    = "1.00,1.00,1.00,1.00,1.00",
+            mainTrackEnabled  = True,
+            audioTrackEnabled = True,
+            motionTrackEnabled= True,
+            frame_rate        = fps,
+            display_mode      = "seconds",
+            custom_width      = width,
+            custom_height     = height,
+            resize_method     = "maintain aspect ratio",
+            divisible_by      = 32,
+            img_compression   = IMG_COMPRESSION,
+            override_audio    = False,
+            timeline_ui       = "",
         )
 
         # Unpack Director outputs
@@ -2447,28 +2459,33 @@ def run_director_workflow(
         MEM.print_memory("after Video VAE load")
 
         _guide_cls  = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
-        _guide_func = getattr(_guide_cls, "FUNCTION", "run")
+        _guide_func = getattr(_guide_cls, "FUNCTION", "execute")
         ltxdirectorguide = _guide_cls()
+        # EXACT signature from ltx_director_guide.py LTXDirectorGuide.execute():
+        # required: positive, negative, vae, latent, guide_data
+        # optional: motion_guide_data=None, model=None, ic_lora_name="None",
+        #           ic_lora_strength=1.0, scale_by=1.0, upscale_method="bicubic",
+        #           image_attention_strength=1.0, crop="center", auto_snap_ic_grid=True,
+        #           use_tiled_encode=False, tile_size=256, tile_overlap=64, retake_mode=False
         node133 = getattr(ltxdirectorguide, _guide_func)(
-            positive=get_value_at_index(node27, 0),
-            negative=get_value_at_index(node27, 1),
-            vae=get_value_at_index(node36_video_vae, 0),
-            latent=director_vid_latent,
-            guide_data=director_guide_data,
-            motion_guide_data=director_motion_data,
-            model=director_model,
-            # widget values from JSON
-            crop_type="None",
-            scale=1,
-            image_strength=0.5,
-            upscale_method="bicubic",
-            scale_factor=1,
-            crop_position="center",
-            use_dilate=True,
-            inpaint_mode=False,
-            dilate_amount=256,
-            dilate_size=64,
-            use_inpaint_mask=False,
+            positive              = get_value_at_index(node27, 0),
+            negative              = get_value_at_index(node27, 1),
+            vae                   = get_value_at_index(node36_video_vae, 0),
+            latent                = director_vid_latent,
+            guide_data            = director_guide_data,
+            motion_guide_data     = director_motion_data,
+            model                 = director_model,
+            ic_lora_name          = "None",
+            ic_lora_strength      = 1.0,
+            scale_by              = 1.0,
+            upscale_method        = "bicubic",
+            image_attention_strength = 0.5,   # Stage 1 image_strength=0.5 from JSON
+            crop                  = "center",
+            auto_snap_ic_grid     = True,
+            use_tiled_encode      = False,
+            tile_size             = 256,
+            tile_overlap          = 64,
+            retake_mode           = False,
         )
         # Outputs: [positive, negative, latent, model, latent_downscale_factor]
         n133_positive = get_value_at_index(node133, 0)
@@ -2543,13 +2560,15 @@ def run_director_workflow(
 
         # ── NODE 55: LTXDirectorCropGuides ────────────────────────────────────
         print("  [N55]  LTXDirectorCropGuides…")
+        # EXACT signature from source: execute(self, positive, negative, latent)
+        # FUNCTION = "execute", RETURN_TYPES = (CONDITIONING, CONDITIONING, LATENT)
         _crop_cls  = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
-        _crop_func = getattr(_crop_cls, "FUNCTION", "run")
+        _crop_func = getattr(_crop_cls, "FUNCTION", "execute")
         ltxdirectorcrop = _crop_cls()
         node55 = getattr(ltxdirectorcrop, _crop_func)(
-            positive=n133_positive,
-            negative=n133_negative,
-            latent=n34_vid_latent,
+            positive = n133_positive,
+            negative = n133_negative,
+            latent   = n34_vid_latent,
         )
         n55_positive = get_value_at_index(node55, 0)
         n55_negative = get_value_at_index(node55, 1)
@@ -2578,24 +2597,24 @@ def run_director_workflow(
         # JSON widget values: None,1,1,bicubic,1,center,True,False,256,64,False
         print("  [N132] LTXDirectorGuide (Stage 2)…")
         node132 = getattr(ltxdirectorguide, _guide_func)(
-            positive=n55_positive,
-            negative=n55_negative,
-            vae=get_value_at_index(node36_video_vae, 0),
-            latent=get_value_at_index(node14, 0),
-            guide_data=director_guide_data,
-            motion_guide_data=director_motion_data,
-            model=director_model,
-            crop_type="None",
-            scale=1,
-            image_strength=1.0,
-            upscale_method="bicubic",
-            scale_factor=1,
-            crop_position="center",
-            use_dilate=True,
-            inpaint_mode=False,
-            dilate_amount=256,
-            dilate_size=64,
-            use_inpaint_mask=False,
+            positive              = n55_positive,
+            negative              = n55_negative,
+            vae                   = get_value_at_index(node36_video_vae, 0),
+            latent                = get_value_at_index(node14, 0),
+            guide_data            = director_guide_data,
+            motion_guide_data     = director_motion_data,
+            model                 = director_model,
+            ic_lora_name          = "None",
+            ic_lora_strength      = 1.0,
+            scale_by              = 1.0,
+            upscale_method        = "bicubic",
+            image_attention_strength = 1.0,   # Stage 2 image_strength=1.0 from JSON
+            crop                  = "center",
+            auto_snap_ic_grid     = True,
+            use_tiled_encode      = False,
+            tile_size             = 256,
+            tile_overlap          = 64,
+            retake_mode           = False,
         )
         n132_positive = get_value_at_index(node132, 0)
         n132_negative = get_value_at_index(node132, 1)
@@ -2710,7 +2729,7 @@ def decode_video_in_chunks(
     vaeloader    = NODE_CLASS_MAPPINGS["VAELoader"]()
     vaedecode    = NODE_CLASS_MAPPINGS["VAEDecode"]()
     _crop_cls_d  = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
-    _crop_func_d = getattr(_crop_cls_d, "FUNCTION", "run")
+    _crop_func_d = getattr(_crop_cls_d, "FUNCTION", "execute")
     ltxdirectorcrop = _crop_cls_d()
 
     # Extract the full latent samples tensor for slicing
