@@ -2217,6 +2217,7 @@ def run_director_workflow(
     input_images:   list,
     input_audio:    str | None,
     skip_loras:     bool = False,
+    validation_mode:bool = False,
 ) -> dict:
     """
     Execute the full Director 2.0 generation pipeline (JSON nodes 135 → 22).
@@ -2397,18 +2398,17 @@ def run_director_workflow(
         node8_audio_vae = vaeloader.load_vae(vae_name=MODEL_FILENAMES["audio_vae"])
         MEM.print_memory("after Audio VAE load")
 
-        # Call LTXDirector with the EXACT signature from ltx_director.py execute():
-        # execute(cls, model, clip, start_second, end_second, duration_seconds,
-        #         start_frame, end_frame, duration_frames, timeline_data,
-        #         local_prompts, segment_lengths, global_prompt="",
-        #         guide_strength="", epsilon=1e-3, frame_rate=24,
-        #         display_mode="seconds", custom_width=768, custom_height=512,
-        #         resize_method="maintain aspect ratio", divisible_by=32,
-        #         img_compression=0, audio_vae=None, optional_latent=None,
-        #         use_custom_audio=False, inpaint_audio=True,
-        #         use_custom_motion=True, override_audio=False)
-        # NOTE: mainTrackEnabled, audioTrackEnabled, motionTrackEnabled, timeline_ui
-        #       are UI-only properties embedded inside timeline_data — NOT execute() params.
+        # img_compression=18 runs H.264 encode/decode on every image in PyAV.
+        # Each 1280×720 frame = ~600 MB RAM spike. 5 images = ~3 GB peak inside Director.
+        # During validation pass: skip compression entirely (img_compression=0).
+        # During full run: use the JSON-authoritative value (18).
+        _img_comp = 0 if validation_mode else IMG_COMPRESSION
+        # Also reduce resolution for validation — use 768×448 (same AR as 1280×720)
+        _val_w = 768 if validation_mode else width
+        _val_h = 448 if validation_mode else height
+        if validation_mode:
+            print(f"  [validation] img_compression=0, resolution={_val_w}×{_val_h} (RAM-safe)")
+
         node131 = getattr(_director_node, _director_func)(
             model              = node10_model_out,
             clip               = get_value_at_index(node12_clip, 0),
@@ -2426,11 +2426,11 @@ def run_director_workflow(
             epsilon            = 0.001,
             frame_rate         = fps,
             display_mode       = "seconds",
-            custom_width       = width,
-            custom_height      = height,
+            custom_width       = _val_w,
+            custom_height      = _val_h,
             resize_method      = "maintain aspect ratio",
             divisible_by       = 32,
-            img_compression    = IMG_COMPRESSION,
+            img_compression    = _img_comp,
             audio_vae          = get_value_at_index(node8_audio_vae, 0),
             optional_latent    = None,
             use_custom_audio   = True,
@@ -3189,15 +3189,16 @@ def run_full_pipeline(
         print("STEP 1 — Running Director workflow…")
         try:
             _gen_result = run_director_workflow(
-                total_frames  = _cfg_frames,
-                seed          = CONFIG["seed"],
-                global_prompt = GLOBAL_PROMPT,
-                fps           = CONFIG["fps"],
-                width         = CONFIG["width"],
-                height        = CONFIG["height"],
-                input_images  = CONFIG["input_images"],
-                input_audio   = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
-                skip_loras    = validate_only,  # skip heavy LoRAs during 3s validation pass
+                total_frames     = _cfg_frames,
+                seed             = CONFIG["seed"],
+                global_prompt    = GLOBAL_PROMPT,
+                fps              = CONFIG["fps"],
+                width            = CONFIG["width"],
+                height           = CONFIG["height"],
+                input_images     = CONFIG["input_images"],
+                input_audio      = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
+                skip_loras       = validate_only,
+                validation_mode  = validate_only,
             )
         except torch.cuda.OutOfMemoryError as oom:
             _report_oom_error("generation", 0, "SamplerCustomAdvanced", _cfg_frames, oom)
@@ -3217,15 +3218,16 @@ def run_full_pipeline(
         # For simplicity, if generation_done=True but we don't have the tensors,
         # we re-run generation (safe because sampling is deterministic with fixed seed).
         _gen_result = run_director_workflow(
-            total_frames  = _cfg_frames,
-            seed          = CONFIG["seed"],
-            global_prompt = GLOBAL_PROMPT,
-            fps           = CONFIG["fps"],
-            width         = CONFIG["width"],
-            height        = CONFIG["height"],
-            input_images  = CONFIG["input_images"],
-            input_audio   = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
-            skip_loras    = validate_only,
+            total_frames     = _cfg_frames,
+            seed             = CONFIG["seed"],
+            global_prompt    = GLOBAL_PROMPT,
+            fps              = CONFIG["fps"],
+            width            = CONFIG["width"],
+            height           = CONFIG["height"],
+            input_images     = CONFIG["input_images"],
+            input_audio      = CONFIG.get("input_audio_prepared") or CONFIG.get("input_audio"),
+            skip_loras       = validate_only,
+            validation_mode  = validate_only,
         )
 
     _vid_latent   = _gen_result["video_latent"]
