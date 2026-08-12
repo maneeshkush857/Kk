@@ -2248,8 +2248,10 @@ def run_director_workflow(
         del node135_model
         MEM.print_memory("after UNet load")
 
-        # ── STEP B: Load CLIP, encode, then immediately DELETE ────────────────
-        # Gemma 12B FP4 ≈ 9 GB. Load → encode → delete before loading VAEs.
+        # ── STEP B: Load CLIP ─────────────────────────────────────────────────
+        # Gemma 12B FP4 ≈ 2.5 GB (FP4 is much smaller than FP16).
+        # Kept alive until AFTER LTXDirector.execute() — Director uses it for text encoding.
+        # Deleted immediately after Director returns.
         print("  [N12] Loading DualCLIPLoader (Gemma FP4 + LTX projection)…")
         dualcliploader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
         node12_clip = dualcliploader.load_clip(
@@ -2258,6 +2260,8 @@ def run_director_workflow(
             type="ltxv",
             device="default",
         )
+        # Safety: ensure node12_clip is always a valid tuple even if load fails
+        assert node12_clip is not None, "DualCLIPLoader returned None — check model files"
         MEM.print_memory("after CLIP load")
 
         # ── STEP C: Apply LoRAs ───────────────────────────────────────────────
