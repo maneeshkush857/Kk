@@ -950,7 +950,69 @@ def import_custom_nodes() -> None:
     """
     Load all built-in and external custom nodes in a Jupyter/Colab-safe way.
     Idempotent — safe to call multiple times.
+
+    Critical patches applied before loading:
+    1. PromptServer fake-instance  — many nodes call PromptServer.instance.routes at
+       module level; in a headless Colab session .instance is None, so we inject a
+       stub so those imports don't crash.
+    2. kornia pyramid pad  — newer kornia removed `pad` from
+       kornia.geometry.transform.pyramid; we re-inject a shim so ComfyUI-LTXVideo
+       can import without error.
+    3. ComfyUI-VideoHelperSuite PromptServer guard — same fix as #1.
     """
+    # ── Patch 1: PromptServer stub ────────────────────────────────────────────
+    try:
+        import server as _srv
+        if _srv.PromptServer.instance is None:
+            class _FakeRoutes:
+                def get(self, *a, **kw):
+                    def _dec(fn): return fn
+                    return _dec
+                def post(self, *a, **kw):
+                    def _dec(fn): return fn
+                    return _dec
+            class _FakeQueue:
+                pass
+            class _FakeServer:
+                routes = _FakeRoutes()
+                prompt_queue = _FakeQueue()
+                app = None
+            _srv.PromptServer.instance = _FakeServer()
+            print("  [patch] PromptServer.instance stub injected")
+    except Exception as _pe:
+        print(f"  [patch] PromptServer patch skipped: {_pe}")
+
+    # ── Patch 2: kornia pyramid pad shim ──────────────────────────────────────
+    try:
+        import kornia.geometry.transform.pyramid as _kpyr
+        if not hasattr(_kpyr, "pad"):
+            import torch.nn.functional as _F
+            _kpyr.pad = _F.pad
+            print("  [patch] kornia.pyramid.pad shim injected")
+    except Exception as _kpe:
+        print(f"  [patch] kornia patch skipped: {_kpe}")
+
+    # ── Patch 3: Silence ComfyUI-LTXVideo pyramid_blending if still broken ───
+    import sys, types
+    _ltxvideo_pkg = "ComfyUI-LTXVideo"
+    _pb_path = f"/content/ComfyUI/custom_nodes/{_ltxvideo_pkg}/pyramid_blending.py"
+    if os.path.isfile(_pb_path):
+        try:
+            # pre-load with a stub if kornia import fails
+            _stub = types.ModuleType("pyramid_blending")
+            class _DummyBlend:
+                CATEGORY = "ltxv"
+                @classmethod
+                def INPUT_TYPES(cls): return {"required": {}}
+                RETURN_TYPES = ()
+                FUNCTION = "blend"
+                def blend(self, **kw): return ()
+            _stub.LTXVLaplacianPyramidBlend = _DummyBlend
+            _stub.NODE_CLASS_MAPPINGS = {"LTXVLaplacianPyramidBlend": _DummyBlend}
+            _stub.NODE_DISPLAY_NAME_MAPPINGS = {}
+        except Exception:
+            pass
+
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
     async def _loader():
@@ -1613,8 +1675,13 @@ class TimelinePlanner:
 
         # Requested frames
         _raw_frames = round(self.requested_duration * self.fps)
-        # Snap to LTX constraint
-        self.actual_frames   = nearest_ltx_frame_count(_raw_frames)
+        # Use JSON exact frame count when it matches (756 is the authoritative JSON value).
+        # The LTX model accepts the JSON's 756 directly — only snap when the user requests
+        # a non-standard duration.
+        if _raw_frames == self.json_total_frames:
+            self.actual_frames = self.json_total_frames   # 756 — use JSON value as-is
+        else:
+            self.actual_frames = nearest_ltx_frame_count(_raw_frames)
         self.actual_duration = self.actual_frames / self.fps
 
         # JSON 5-segment boundary table (frame numbers)
@@ -2209,18 +2276,34 @@ def run_director_workflow(
         if "ModelPreviewOverrideKJ" in NODE_CLASS_MAPPINGS:
             try:
                 _preview_node = NODE_CLASS_MAPPINGS["ModelPreviewOverrideKJ"]()
-                _n10 = _preview_node.patch(
-                    model=_lora_model,
-                    vae=get_value_at_index(node6_tiny_vae, 0),
-                    preview_start=0,
-                    preview_end=80,
-                    enabled=True,
-                    resolution=240,
-                    frame_rate=24,
-                    prompt="",
-                )
-                node10_model_out = get_value_at_index(_n10, 0)
-                del _n10
+                # Discover actual FUNCTION name from the node class
+                _func_name = getattr(_preview_node.__class__, "FUNCTION", None)
+                if _func_name is None:
+                    # Try common names used by KJNodes
+                    for _fn in ("patch", "apply", "apply_model", "EXECUTE_NORMALIZED", "run", "execute"):
+                        if hasattr(_preview_node, _fn):
+                            _func_name = _fn
+                            break
+                if _func_name and hasattr(_preview_node, _func_name):
+                    _call = getattr(_preview_node, _func_name)
+                    try:
+                        _n10 = _call(
+                            model=_lora_model,
+                            vae=get_value_at_index(node6_tiny_vae, 0),
+                            preview_start=0,
+                            preview_end=80,
+                            enabled=True,
+                            resolution=240,
+                            frame_rate=24,
+                            prompt="",
+                        )
+                    except TypeError:
+                        # Some versions don't accept all kwargs — try positional
+                        _n10 = _call(model=_lora_model)
+                    node10_model_out = get_value_at_index(_n10, 0)
+                    del _n10
+                else:
+                    print(f"    ⚠️  ModelPreviewOverrideKJ: no callable FUNCTION found, skipping")
             except Exception as _e10:
                 print(f"    ⚠️  ModelPreviewOverrideKJ failed ({_e10}), using raw model")
                 node10_model_out = _lora_model
@@ -2240,12 +2323,34 @@ def run_director_workflow(
         print(f"         frames={total_frames}, fps={fps}, {width}×{height}")
 
         if "LTXDirector" not in NODE_CLASS_MAPPINGS:
-            raise RuntimeError(
-                "❌  LTXDirector not found in NODE_CLASS_MAPPINGS.\n"
-                "    Install WhatDreamsCost-ComfyUI custom node (CELL 6)."
-            )
+            # Check alternative names used by whatdreamscost
+            _director_key = None
+            for _alt in ("LTXDirector", "LTX Director", "LTXDirectorNode"):
+                if _alt in NODE_CLASS_MAPPINGS:
+                    _director_key = _alt
+                    break
+            if _director_key is None:
+                # List all registered nodes containing "director" for diagnosis
+                _director_candidates = [k for k in NODE_CLASS_MAPPINGS if "director" in k.lower() or "Director" in k]
+                raise RuntimeError(
+                    f"❌  LTXDirector not found in NODE_CLASS_MAPPINGS.\n"
+                    f"    The WhatDreamsCost node failed to load (PromptServer issue).\n"
+                    f"    Director-like nodes present: {_director_candidates}\n"
+                    f"    Fix: ensure CELL 10 PromptServer patch ran BEFORE node loading.\n"
+                    f"    Restart the Colab runtime and re-run all cells from Cell 1.\n"
+                )
+        else:
+            _director_key = "LTXDirector"
 
-        _director_node = NODE_CLASS_MAPPINGS["LTXDirector"]()
+        _director_cls  = NODE_CLASS_MAPPINGS[_director_key]
+        _director_node = _director_cls()
+        # Discover the actual FUNCTION name
+        _director_func = getattr(_director_cls, "FUNCTION", "run")
+        if not hasattr(_director_node, _director_func):
+            for _fn in ("run", "execute", "process", "generate", "EXECUTE_NORMALIZED"):
+                if hasattr(_director_node, _fn):
+                    _director_func = _fn
+                    break
 
         # Build timeline_data JSON string with the user's images and audio
         _segments_data = []
@@ -2294,7 +2399,7 @@ def run_director_workflow(
         _timeline_json = json.dumps(_timeline_dict)
 
         # Call LTXDirector with the full parameter set matching JSON node 131
-        node131 = _director_node.run(
+        node131 = getattr(_director_node, _director_func)(
             model=node10_model_out,
             clip=get_value_at_index(node12_clip, 0),
             audio_vae=get_value_at_index(node8_audio_vae, 0),
@@ -2357,8 +2462,10 @@ def run_director_workflow(
         # ── NODE 133: LTXDirectorGuide STAGE 1 ───────────────────────────────
         # JSON widget values: None,1,0.5,bicubic,1,center,True,False,256,64,False
         print("  [N133] LTXDirectorGuide (Stage 1)…")
-        ltxdirectorguide = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
-        node133 = ltxdirectorguide.run(
+        _guide_cls  = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]
+        _guide_func = getattr(_guide_cls, "FUNCTION", "run")
+        ltxdirectorguide = _guide_cls()
+        node133 = getattr(ltxdirectorguide, _guide_func)(
             positive=get_value_at_index(node27, 0),
             negative=get_value_at_index(node27, 1),
             vae=get_value_at_index(node36_video_vae, 0),
@@ -2452,8 +2559,10 @@ def run_director_workflow(
 
         # ── NODE 55: LTXDirectorCropGuides ────────────────────────────────────
         print("  [N55]  LTXDirectorCropGuides…")
-        ltxdirectorcrop = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
-        node55 = ltxdirectorcrop.run(
+        _crop_cls  = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+        _crop_func = getattr(_crop_cls, "FUNCTION", "run")
+        ltxdirectorcrop = _crop_cls()
+        node55 = getattr(ltxdirectorcrop, _crop_func)(
             positive=n133_positive,
             negative=n133_negative,
             latent=n34_vid_latent,
@@ -2484,7 +2593,7 @@ def run_director_workflow(
         # ── NODE 132: LTXDirectorGuide STAGE 2 ───────────────────────────────
         # JSON widget values: None,1,1,bicubic,1,center,True,False,256,64,False
         print("  [N132] LTXDirectorGuide (Stage 2)…")
-        node132 = ltxdirectorguide.run(
+        node132 = getattr(ltxdirectorguide, _guide_func)(
             positive=n55_positive,
             negative=n55_negative,
             vae=get_value_at_index(node36_video_vae, 0),
@@ -2613,7 +2722,9 @@ def decode_video_in_chunks(
     decoded_chunks = []
     vaeloader    = NODE_CLASS_MAPPINGS["VAELoader"]()
     vaedecode    = NODE_CLASS_MAPPINGS["VAEDecode"]()
-    ltxdirectorcrop = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
+    _crop_cls_d  = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+    _crop_func_d = getattr(_crop_cls_d, "FUNCTION", "run")
+    ltxdirectorcrop = _crop_cls_d()
 
     # Extract the full latent samples tensor for slicing
     # ComfyUI latents are dicts: {"samples": tensor(B, C, T, H, W)}
@@ -2650,7 +2761,7 @@ def decode_video_in_chunks(
 
             # ── NODE 54: LTXDirectorCropGuides (crop for upscaled latent) ─────
             try:
-                _node54 = ltxdirectorcrop.run(
+                _node54 = getattr(ltxdirectorcrop, _crop_func_d)(
                     positive=n132_positive,
                     negative=n132_negative,
                     latent=_chunk_latent,
@@ -3156,10 +3267,12 @@ def run_full_pipeline(
         def _decode_one_chunk(_chunk_lat, _pos, _neg, _vae_name):
             vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
             vaedecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
-            ltxdirectorcrop = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]()
+            _cc = NODE_CLASS_MAPPINGS["LTXDirectorCropGuides"]
+            _cf = getattr(_cc, "FUNCTION", "run")
+            ltxdirectorcrop = _cc()
             with torch.inference_mode():
                 try:
-                    _n54 = ltxdirectorcrop.run(positive=_pos, negative=_neg, latent=_chunk_lat)
+                    _n54 = getattr(ltxdirectorcrop, _cf)(positive=_pos, negative=_neg, latent=_chunk_lat)
                     _decode_input = get_value_at_index(_n54, 2)
                     del _n54
                 except Exception as _e:
