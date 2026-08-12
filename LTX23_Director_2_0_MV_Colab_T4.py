@@ -201,6 +201,13 @@ print(f"   Workspace  : {CONFIG['workspace']}")
 # ╚══════════════════════════════════════════════════════════════════╝
 
 import sys
+import os
+
+# MUST be set before importing torch — controls memory allocator behavior
+# expandable_segments:True  reduces fragmentation on T4
+# max_split_size_mb:512     prevents large contiguous allocations that fail
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+
 import torch
 
 print("=" * 60)
@@ -233,14 +240,7 @@ if _total_vram < 13.0:
         f"    This pipeline requires ≥14 GB. Upgrade to T4/V100/A100.\n"
     )
 
-# Configure CUDA allocator for fragmentation resistance
-try:
-    _alloc_conf = "expandable_segments:True"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _alloc_conf
-    print(f"CUDA allocator : {_alloc_conf}")
-except Exception as _e:
-    print(f"⚠️  Could not set PYTORCH_CUDA_ALLOC_CONF: {_e}")
-
+print(f"CUDA allocator : {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'not set')}")
 print("\n✅ CELL 2 — GPU validated")
 
 
@@ -327,6 +327,12 @@ class LTXMemoryManager:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # Also call ComfyUI's soft_empty_cache if available
+        try:
+            import comfy.model_management as _cmm
+            _cmm.soft_empty_cache()
+        except Exception:
+            pass
 
     def cleanup(self) -> None:
         """Standard cleanup after each operation."""
@@ -335,16 +341,55 @@ class LTXMemoryManager:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         gc.collect()
+        # ComfyUI model management cleanup
+        try:
+            import comfy.model_management as _cmm
+            _cmm.soft_empty_cache()
+            _cmm.cleanup_models_gc()
+        except Exception:
+            pass
 
     def aggressive_cleanup(self) -> None:
-        """Full cleanup — synchronize CUDA, collect, clear cache."""
+        """Full cleanup — synchronize CUDA, collect, clear cache, evict ComfyUI models."""
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+        # ComfyUI model management — unload everything not currently needed
+        try:
+            import comfy.model_management as _cmm
+            _cmm.soft_empty_cache(force=True)
+            _cmm.cleanup_models_gc()
+            _cmm.cleanup_models()
+        except Exception:
+            pass
         gc.collect()
         time.sleep(0.1)   # brief yield so OS can reclaim pages
+
+    def pre_sampling_cleanup(self) -> None:
+        """
+        Called immediately before SamplerCustomAdvanced to maximize free VRAM.
+        Uses ComfyUI's free_memory() to evict all non-essential models.
+        The GGUF UNet will be re-loaded by ComfyUI automatically when needed.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        try:
+            import comfy.model_management as _cmm
+            _device = _cmm.get_torch_device()
+            # Request maximum free memory — ComfyUI will offload models to CPU
+            # keeping only what's needed for the current operation
+            _cmm.free_memory(2 * (1024**3), _device)   # request 2 GB free
+            _cmm.soft_empty_cache(force=True)
+        except Exception as _e:
+            print(f"  [pre_sampling_cleanup] comfy.model_management unavailable: {_e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        gc.collect()
+        self.print_memory("pre-sampling (after cleanup)")
 
     # ── named-reference helpers ───────────────────────────────────────────────
 
@@ -2399,6 +2444,7 @@ def run_validation_workflow(
         _n1   = _rn1.EXECUTE_NORMALIZED(noise_seed=seed)
 
         print("  [VAL] Stage 1 sampling (4 steps)…")
+        MEM.pre_sampling_cleanup()
         _sampler_node = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
         _s1_out = _sampler_node.EXECUTE_NORMALIZED(
             noise        = get_value_at_index(_n1, 0),
@@ -2455,6 +2501,7 @@ def run_validation_workflow(
         _n2   = _rn1.EXECUTE_NORMALIZED(noise_seed=0)
 
         print("  [VAL] Stage 2 sampling (4 steps, denoise=0.42)…")
+        MEM.pre_sampling_cleanup()
         _s2_out = _sampler_node.EXECUTE_NORMALIZED(
             noise        = get_value_at_index(_n2, 0),
             guider       = get_value_at_index(_g2, 0),
@@ -2833,6 +2880,7 @@ def run_director_workflow(
 
         # ── NODE 31: SamplerCustomAdvanced — STAGE 1 ──────────────────────────
         print("  [N31]  SamplerCustomAdvanced — STAGE 1 sampling…")
+        MEM.pre_sampling_cleanup()
         samplercustom = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
         node31 = samplercustom.EXECUTE_NORMALIZED(
             noise=get_value_at_index(node30, 0),
@@ -2957,6 +3005,7 @@ def run_director_workflow(
         # ── NODE 19: SamplerCustomAdvanced — STAGE 2 ──────────────────────────
         # Uses same RandomNoise node30 (seed=0, fixed) as Stage 1 per JSON links
         print("  [N19]  SamplerCustomAdvanced — STAGE 2 refine sampling…")
+        MEM.pre_sampling_cleanup()
         node19 = samplercustom.EXECUTE_NORMALIZED(
             noise=get_value_at_index(node30, 0),
             guider=get_value_at_index(node17, 0),
