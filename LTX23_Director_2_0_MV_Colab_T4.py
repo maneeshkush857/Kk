@@ -2385,14 +2385,9 @@ def run_director_workflow(
         _timeline_json = json.dumps(_timeline_dict)
 
         # ── Load Audio VAE just before LTXDirector (then delete) ─────────────
-        # IMPORTANT: Delete CLIP first to free ~2.5 GB before loading Audio VAE
-        # and before LTXDirector processes the 5 images (another ~0.5–1 GB peak).
-        print("  Freeing CLIP from RAM before Audio VAE + Director…")
-        del node12_clip
-        MEM.aggressive_cleanup()
-        MEM.print_memory("after CLIP freed")
-
-        # Loading here (not at the top) keeps RAM free while CLIP was resident.
+        # IMPORTANT: Delete CLIP after LoRAs but we MUST keep it alive until
+        # after LTXDirector.execute() — the Director needs clip for text encoding.
+        # We free it immediately after the Director call below.
         print("  [N8]  Loading Audio VAE (lazy)…")
         vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
         node8_audio_vae = vaeloader.load_vae(vae_name=MODEL_FILENAMES["audio_vae"])
@@ -2451,10 +2446,10 @@ def run_director_workflow(
 
         MEM.print_memory("after LTXDirector")
 
-        # Free Audio VAE and node131 result — Director output tensors are now unpacked
-        del node8_audio_vae, node131
+        # Free CLIP, Audio VAE and node131 — Director consumed clip, outputs are unpacked
+        del node12_clip, node8_audio_vae, node131
         MEM.aggressive_cleanup()
-        MEM.print_memory("after AudioVAE+Director freed")
+        MEM.print_memory("after CLIP+AudioVAE+Director freed")
 
         # ── NODE 128: ConditioningZeroOut ─────────────────────────────────────
         print("  [N128] ConditioningZeroOut…")
